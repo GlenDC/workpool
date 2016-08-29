@@ -126,6 +126,7 @@ import (
 )
 
 var (
+	// ErrCapacity is the error that gets returned when the queue is too full
 	ErrCapacity = errors.New("Thread Pool At Capacity")
 )
 
@@ -133,19 +134,20 @@ type (
 	// poolWork is passed into the queue for work to be performed.
 	poolWork struct {
 		work          PoolWorker // The Work to be performed.
+		workChannelID int        // The ID of the work channel, this work should be assigned to
 		resultChannel chan error // Used to inform the queue operaion is complete.
 	}
 
 	// WorkPool implements a work pool with the specified concurrency level and queue capacity.
 	WorkPool struct {
-		shutdownQueueChannel chan string     // Channel used to shut down the queue routine.
-		shutdownWorkChannel  chan struct{}   // Channel used to shut down the work routines.
-		shutdownWaitGroup    sync.WaitGroup  // The WaitGroup for shutting down existing routines.
-		queueChannel         chan poolWork   // Channel used to sync access to the queue.
-		workChannel          chan PoolWorker // Channel used to process work.
-		queuedWork           int32           // The number of work items queued.
-		activeRoutines       int32           // The number of routines active.
-		queueCapacity        int32           // The max number of items we can store in the queue.
+		shutdownQueueChannel chan string       // Channel used to shut down the queue routine.
+		shutdownWorkChannel  chan struct{}     // Channel used to shut down the work routines.
+		shutdownWaitGroup    sync.WaitGroup    // The WaitGroup for shutting down existing routines.
+		queueChannel         chan poolWork     // Channel used to sync access to the queue.
+		workChannels         []chan PoolWorker // Channel used to process work.
+		queuedWork           int32             // The number of work items queued.
+		activeRoutines       int32             // The number of routines active.
+		queueCapacity        int32             // The max number of items we can store in the queue.
 	}
 )
 
@@ -161,22 +163,33 @@ func init() {
 }
 
 // New creates a new WorkPool.
-func New(numberOfRoutines int, queueCapacity int32) *WorkPool {
+func New(numberOfWorkerChannels int, queueCapacity int32) *WorkPool {
+	if numberOfWorkerChannels == 0 {
+		numberOfWorkerChannels = 1
+	}
+
+	semaphores := make([]*sync.Mutex, numberOfWorkerChannels)
+	workChannels := make([]chan PoolWorker, numberOfWorkerChannels)
+	for i := 0; i < numberOfWorkerChannels; i++ {
+		workChannels[i] = make(chan PoolWorker, queueCapacity)
+		semaphores[i] = new(sync.Mutex)
+	}
+
 	workPool := WorkPool{
 		shutdownQueueChannel: make(chan string),
 		shutdownWorkChannel:  make(chan struct{}),
 		queueChannel:         make(chan poolWork),
-		workChannel:          make(chan PoolWorker, queueCapacity),
+		workChannels:         workChannels,
 		queuedWork:           0,
 		activeRoutines:       0,
 		queueCapacity:        queueCapacity,
 	}
 
 	// Add the total number of routines to the wait group
-	workPool.shutdownWaitGroup.Add(numberOfRoutines)
+	workPool.shutdownWaitGroup.Add(numberOfWorkerChannels)
 
 	// Launch the work routines to process work
-	for workRoutine := 0; workRoutine < numberOfRoutines; workRoutine++ {
+	for workRoutine := 0; workRoutine < numberOfWorkerChannels; workRoutine++ {
 		go workPool.workRoutine(workRoutine)
 	}
 
@@ -205,7 +218,9 @@ func (workPool *WorkPool) Shutdown(goRoutine string) (err error) {
 	close(workPool.shutdownWorkChannel)
 	workPool.shutdownWaitGroup.Wait()
 
-	close(workPool.workChannel)
+	for index := range workPool.workChannels {
+		close(workPool.workChannels[index])
+	}
 
 	writeStdout(goRoutine, "Shutdown", "Completed")
 	return err
@@ -213,15 +228,23 @@ func (workPool *WorkPool) Shutdown(goRoutine string) (err error) {
 
 // PostWork will post work into the WorkPool. This call will block until the Queue routine reports back
 // success or failure that the work is in queue.
-func (workPool *WorkPool) PostWork(goRoutine string, work PoolWorker) (err error) {
+func (workPool *WorkPool) PostWork(goRoutine string, workChannelID int, work PoolWorker) (err error) {
+	if workChannelID < 0 || workChannelID >= len(workPool.workChannels) {
+		return fmt.Errorf("%d is an invalid workChannelID", workChannelID)
+	}
+
 	defer catchPanic(&err, goRoutine, "PostWork")
 
-	poolWork := poolWork{work, make(chan error)}
+	job := poolWork{
+		work:          work,
+		workChannelID: workChannelID,
+		resultChannel: make(chan error),
+	}
 
-	defer close(poolWork.resultChannel)
+	defer close(job.resultChannel)
 
-	workPool.queueChannel <- poolWork
-	err = <-poolWork.resultChannel
+	workPool.queueChannel <- job
+	err = <-job.resultChannel
 
 	return err
 }
@@ -270,11 +293,8 @@ func (workPool *WorkPool) workRoutine(workRoutine int) {
 			writeStdout(fmt.Sprintf("WorkRoutine %d", workRoutine), "workRoutine", "Going Down")
 			workPool.shutdownWaitGroup.Done()
 			return
-
-		// There is work in the queue.
-		case poolWorker := <-workPool.workChannel:
+		case poolWorker := <-workPool.workChannels[workRoutine]:
 			workPool.safelyDoWork(workRoutine, poolWorker)
-			break
 		}
 	}
 }
@@ -314,7 +334,8 @@ func (workPool *WorkPool) queueRoutine() {
 			atomic.AddInt32(&workPool.queuedWork, 1)
 
 			// Queue the work for the WorkRoutine to process.
-			workPool.workChannel <- queueItem.work
+
+			workPool.workChannels[queueItem.workChannelID] <- queueItem.work
 
 			// Tell the caller the work is queued.
 			queueItem.resultChannel <- nil
